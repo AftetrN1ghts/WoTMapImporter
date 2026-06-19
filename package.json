@@ -1,0 +1,17 @@
+{
+    "name": "com.arenai.wot-map-importer",
+    "version": "1.0.0",
+    "description": "Import World of Tanks maps (terrain, objects, water) directly into Unity from .pkg files. Inspired by Simi4's WoT-Blender-Addons tank_viewer.",
+    "displayName": "WoT Map Importer",
+    "unity": "2022.3",
+    "keywords": [
+        "wot",
+        "world-of-tanks",
+        "terrain",
+        "importer",
+        "bigworld"
+    ],
+    "author": {
+        "name": "Arena.ai"
+    }
+}
