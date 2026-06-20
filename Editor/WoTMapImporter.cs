@@ -233,18 +233,124 @@ namespace WoTMapImporter.Editor
                 }
             }
 
-            // New format: space.bin (compiled space)
+            // New format: space.bin (compiled space).  We only need BWT2.settings
+            // here: chunk_size, bounds, normal_map_fnv, global_map_fnv, noise_fnv.
             string spaceBinPath = Path.Combine(spaceDir, "space.bin");
             if (File.Exists(spaceBinPath))
             {
-                WoTLogger.Info($"Found space.bin ({new FileInfo(spaceBinPath).Length} bytes), but CompiledSpace parsing not implemented");
-                WoTLogger.Warn("Compiled space metadata extraction not yet supported; bounds will be derived from cdata filenames");
+                try
+                {
+                    if (TryReadCompiledTerrainMetadata(File.ReadAllBytes(spaceBinPath), ut))
+                    {
+                        WoTLogger.Info($"space.bin BWT2 terrain: chunkSize={ut.ChunkSize} bounds x[{ut.MinX}..{ut.MaxX}] y[{ut.MinY}..{ut.MaxY}] globalMap='{ut.GlobalMap}'");
+                        return ut;
+                    }
+                }
+                catch (Exception e)
+                {
+                    WoTLogger.Warn($"Could not parse BWT2 terrain metadata: {e.Message}");
+                }
             }
 
-            // Fallback: derive from cdata files we have
+            // Fallback: derive from cdata files later; keep zero bounds for now.
             ut.MinX = ut.MinY = 0;
             ut.MaxX = ut.MaxY = 0;
             return ut;
+        }
+
+        private struct SpaceRow
+        {
+            public string Header;
+            public uint Position;
+            public uint Length;
+        }
+
+        private static bool TryReadCompiledTerrainMetadata(byte[] bin, UniversalTerrain ut)
+        {
+            using var ms = new MemoryStream(bin, false);
+            using var br = new BinaryReader(ms);
+
+            var rows = ReadSpaceRows(br);
+            if (!rows.TryGetValue("BWT2", out var bwt2))
+                return false;
+
+            var strings = rows.TryGetValue("BWST", out var bwst)
+                ? ReadSpaceStringTable(br, bwst)
+                : new Dictionary<uint, string>();
+
+            br.BaseStream.Position = bwt2.Position;
+            uint settingsSize = br.ReadUInt32();
+            if (settingsSize < 32)
+                return false;
+
+            ut.ChunkSize = br.ReadSingle();
+            ut.MinX = br.ReadInt32();
+            ut.MaxX = br.ReadInt32();
+            ut.MinY = br.ReadInt32();
+            ut.MaxY = br.ReadInt32();
+            uint normalMapFnv = br.ReadUInt32();
+            uint globalMapFnv = br.ReadUInt32();
+            uint noiseFnv = br.ReadUInt32();
+
+            if (strings.TryGetValue(globalMapFnv, out var globalMap))
+                ut.GlobalMap = globalMap.ToLowerInvariant();
+            else if (globalMapFnv != 0)
+                WoTLogger.Warn($"BWT2 global_map_fnv 0x{globalMapFnv:X8} was not found in BWST");
+
+            return ut.ChunkSize > 0.01f;
+        }
+
+        private static Dictionary<string, SpaceRow> ReadSpaceRows(BinaryReader br)
+        {
+            br.BaseStream.Position = 0;
+            string rootHeader = ReadSpaceHeader(br);
+            if (rootHeader != "BWTB") throw new Exception($"Not a compiled space, root={rootHeader}");
+            br.ReadUInt32();
+            br.ReadUInt32();
+            br.ReadUInt32();
+            br.ReadUInt32();
+            uint rowsNum = br.ReadUInt32();
+
+            var rows = new Dictionary<string, SpaceRow>();
+            for (uint i = 0; i < rowsNum; i++)
+            {
+                string h = ReadSpaceHeader(br);
+                br.ReadUInt32();
+                uint pos = br.ReadUInt32();
+                br.ReadUInt32();
+                uint len = br.ReadUInt32();
+                br.ReadUInt32();
+                rows[h] = new SpaceRow { Header = h, Position = pos, Length = len };
+            }
+            return rows;
+        }
+
+        private static string ReadSpaceHeader(BinaryReader br)
+        {
+            return System.Text.Encoding.ASCII.GetString(br.ReadBytes(4));
+        }
+
+        private static Dictionary<uint, string> ReadSpaceStringTable(BinaryReader br, SpaceRow row)
+        {
+            var result = new Dictionary<uint, string>();
+            if (row.Length == 0) return result;
+            br.BaseStream.Position = row.Position;
+
+            uint elemSize = br.ReadUInt32();
+            uint count = br.ReadUInt32();
+            var entries = new (uint hash, uint offset, uint length)[count];
+            for (uint i = 0; i < count; i++)
+                entries[i] = (br.ReadUInt32(), br.ReadUInt32(), br.ReadUInt32());
+
+            uint stringsSize = br.ReadUInt32();
+            long stringsStart = br.BaseStream.Position;
+            foreach (var e in entries)
+            {
+                br.BaseStream.Position = stringsStart + e.offset;
+                var bytes = br.ReadBytes((int)e.length);
+                result[e.hash] = System.Text.Encoding.GetEncoding("ISO-8859-1").GetString(bytes);
+            }
+            return result;
         }
 
         // =================== CHUNK LOADING ===================

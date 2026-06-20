@@ -7,6 +7,8 @@ Shader "WoT/TerrainMultilayer"
         [HideInInspector] _Control1 ("Control1", 2D) = "black" {}
         [HideInInspector] _Control2 ("Control2", 2D) = "black" {}
         [HideInInspector] _Control3 ("Control3", 2D) = "black" {}
+        [HideInInspector] _GlobalMap ("Global AM", 2D) = "white" {}
+        _UseGlobalMap ("Use Global AM", Float) = 0
 
         [HideInInspector] _Splat0 ("Splat0", 2D) = "white" {}
         [HideInInspector] _Splat1 ("Splat1", 2D) = "white" {}
@@ -49,6 +51,7 @@ Shader "WoT/TerrainMultilayer"
             TEXTURE2D(_Control1);
             TEXTURE2D(_Control2);
             TEXTURE2D(_Control3);
+            TEXTURE2D(_GlobalMap);
 
             #define DECL_SPLAT(n) TEXTURE2D(_Splat##n);
             DECL_SPLAT(0) DECL_SPLAT(1) DECL_SPLAT(2) DECL_SPLAT(3)
@@ -62,7 +65,12 @@ Shader "WoT/TerrainMultilayer"
                 float4 _Splat4_ST;  float4 _Splat5_ST;  float4 _Splat6_ST;  float4 _Splat7_ST;
                 float4 _Splat8_ST;  float4 _Splat9_ST;  float4 _Splat10_ST; float4 _Splat11_ST;
                 float4 _Splat12_ST; float4 _Splat13_ST; float4 _Splat14_ST; float4 _Splat15_ST;
+                float4 _LayerU[16];
+                float4 _LayerV[16];
+                float4 _TerrainGlobal; // x=minWorldX, y=minWorldZ, z=sizeX, w=sizeZ
+                float4 _GlobalMap_ST;
                 float _NumLayers;
+                float _UseGlobalMap;
             CBUFFER_END
 
             struct Attributes
@@ -91,9 +99,43 @@ Shader "WoT/TerrainMultilayer"
                 return OUT;
             }
 
-            float3 SampleSplat(int idx, float2 uvc)
+            float2 WrapWoTLayerUV(float2 uv)
             {
-                #define SAMP(n) if (idx==n) { float2 uv = uvc * _Splat##n##_ST.xy + _Splat##n##_ST.zw; return SAMPLE_TEXTURE2D(_Splat##n, sampler_Splat0, uv).rgb; }
+                // Blender TerrainLayerMappingGroup wraps texture coordinates into
+                // [0.0625 .. 0.9375] instead of plain 0..1.  This avoids the 1/16
+                // border of WoT terrain tile textures/atlases.
+                const float mn = 0.0625;
+                const float mx = 0.9375;
+                const float span = mx - mn;
+                return mn + frac((uv - mn) / span) * span;
+            }
+
+            float2 LayerUV(int idx, float3 positionWS)
+            {
+                // The Blender addon does not use per-chunk local UV for tile
+                // textures. It builds world_uv = Generated * chunk_size + chunk_pos,
+                // then applies the layer projection. In Unity positionWS.xz is that
+                // same continuous world coordinate, so texture patterns now match
+                // across chunk borders.
+                float3 p = float3(positionWS.x, 0.0, positionWS.z);
+                float u = dot(p, _LayerU[idx].xyz) + _LayerU[idx].w;
+                float v = dot(p, _LayerV[idx].xyz) + _LayerV[idx].w;
+                return WrapWoTLayerUV(float2(u, v));
+            }
+
+            float3 DecodeWoTAM(float4 c)
+            {
+                // Important: do NOT un-premultiply here.  In practice WoT *_AM.dds
+                // alpha also carries material data, and dividing RGB by A makes the
+                // whole map washed out.  This matches the visual result of using
+                // ImageTexture.Color in the Blender addon more closely.
+                return c.rgb;
+            }
+
+            float3 SampleSplat(int idx, float3 positionWS)
+            {
+                float2 uv = LayerUV(idx, positionWS);
+                #define SAMP(n) if (idx==n) { return DecodeWoTAM(SAMPLE_TEXTURE2D(_Splat##n, sampler_Splat0, uv)); }
                 SAMP(0) SAMP(1) SAMP(2) SAMP(3) SAMP(4) SAMP(5) SAMP(6) SAMP(7)
                 SAMP(8) SAMP(9) SAMP(10) SAMP(11) SAMP(12) SAMP(13) SAMP(14) SAMP(15)
                 return float3(0,0,0);
@@ -120,10 +162,27 @@ Shader "WoT/TerrainMultilayer"
                 [loop] for (int i = 0; i < 16; i++)
                 {
                     if (i >= n) break;
-                    albedo += SampleSplat(i, uvc) * w[i];
+                    albedo += SampleSplat(i, IN.positionWS) * w[i];
                     wsum += w[i];
                 }
-                if (wsum > 1e-4) albedo /= wsum; else albedo = SampleSplat(0, uvc);
+                // Match Simi4 Blender addon: colors are combined as a raw
+                // multiply-add chain, without normalizing the sum of weights.
+                // Normalizing makes a tiny overlay mask become a full-coverage
+                // Unity terrain layer, which is why chunks looked like one solid
+                // texture. If every weight is zero, fall back to layer 0.
+                if (wsum <= 1e-4) albedo = SampleSplat(0, IN.positionWS);
+
+                // Optional global AM/tint map from BWT2.settings.global_map_fnv.
+                // Blender multiplies terrain base color by this texture when its
+                // wetness/global AM option is enabled.  It restores the broad map
+                // tint that tile textures alone cannot provide.
+                if (_UseGlobalMap > 0.5)
+                {
+                    float2 guv = (IN.positionWS.xz - _TerrainGlobal.xy) / _TerrainGlobal.zw;
+                    guv = guv * _GlobalMap_ST.xy + _GlobalMap_ST.zw;
+                    float3 g = SAMPLE_TEXTURE2D(_GlobalMap, sampler_Control0, saturate(guv)).rgb;
+                    albedo *= g;
+                }
 
                 float3 nWS = normalize(IN.normalWS);
                 Light mainLight = GetMainLight();

@@ -21,8 +21,12 @@ namespace WoTMapImporter.Editor.Terrain
     {
         public class BuildResult
         {
+            // Root object that contains all terrain chunks. Kept in TerrainObject
+            // for backward compatibility with the previous single-terrain API.
             public GameObject TerrainObject;
-            public TerrainData TerrainData;
+            public TerrainData TerrainData; // first chunk TerrainData, for compatibility
+            public List<GameObject> TerrainObjects = new List<GameObject>();
+            public List<TerrainData> TerrainDatas = new List<TerrainData>();
             public List<string> Warnings = new List<string>();
         }
 
@@ -34,6 +38,17 @@ namespace WoTMapImporter.Editor.Terrain
             public float chunkSize;
         }
 
+        /// <summary>
+        /// Builds terrain as separate Unity Terrain chunks, one chunk per *.cdata.
+        /// This follows the Blender addon's behaviour: it does NOT stitch all cdata
+        /// into one giant terrain.  Per-chunk building also fixes splat painting
+        /// because blend_textures are local to each chunk and layer order is local.
+        ///
+        /// Blender reference for new blend format:
+        ///   blend_texture[i].A -> layer[i*2]
+        ///   blend_texture[i].G -> layer[i*2+1]
+        /// and the blend texture V coordinate is flipped by Mapping Scale (1, -1, 1).
+        /// </summary>
         public static BuildResult Build(
             string outputPath,
             MapInfo mapInfo,
@@ -46,227 +61,498 @@ namespace WoTMapImporter.Editor.Terrain
             if (chunks.Count == 0)
                 throw new Exception("No terrain chunks to build");
 
-            int chunkPixels = chunks[0].HeightsTex.width;
-            int totalPixelsX = terrain.NumChunksX * chunkPixels;
-            int totalPixelsZ = terrain.NumChunksY * chunkPixels;
+            EnsureFolder(outputPath);
+            EnsureFolder(outputPath + "/TerrainData");
 
-            int targetRes = LargestPow2Plus1(maxResolution);
-            if (targetRes > totalPixelsX) targetRes = LargestPow2Plus1Ceil(totalPixelsX);
-            if (targetRes > maxResolution) targetRes = maxResolution;
-
-            WoTLogger.Info($"Stitching {chunks.Count} chunks: grid {terrain.NumChunksX}x{terrain.NumChunksY}, " +
-                           $"pixels per chunk {chunkPixels}, total {totalPixelsX}x{totalPixelsZ}, " +
-                           $"Unity heightmap {targetRes}x{targetRes}");
-
-            // Compute world bounds (lower-left of map)
-            float minX = float.MaxValue, minY = float.MaxValue;
-            foreach (var c in chunks)
+            // Sort so prefab hierarchy is deterministic.
+            chunks.Sort((a, b) =>
             {
-                if (c.ChunkPos.x < minX) minX = c.ChunkPos.x;
-                if (c.ChunkPos.y < minY) minY = c.ChunkPos.y;
+                int by = a.ChunkPos.y.CompareTo(b.ChunkPos.y);
+                return by != 0 ? by : a.ChunkPos.x.CompareTo(b.ChunkPos.x);
+            });
+
+            // Use one vertical range for all chunks, otherwise neighbouring Terrain
+            // objects would have different size.y and would not line up.
+            ComputeGlobalHeightRange(chunks, out float hMin, out float hMax);
+            float heightRange = Mathf.Max(hMax - hMin, 1f);
+            float sizeY = heightRange * 1.05f;
+
+            WoTLogger.Info($"Building CHUNKED terrain: {chunks.Count} chunks, grid {terrain.NumChunksX}x{terrain.NumChunksY}, " +
+                           $"chunkSize={terrain.ChunkSize:F1}m, height min={hMin:F1} max={hMax:F1} sizeY={sizeY:F1}");
+
+            var result = new BuildResult();
+            var root = new GameObject(mapInfo.Name + "_TerrainChunks");
+            result.TerrainObject = root;
+
+            var terrainByCoord = new Dictionary<Vector2Int, UnityEngine.Terrain>();
+            Texture2D globalMapTex = LoadGlobalMapTexture(terrain, resMgr, outputPath);
+
+            for (int ci = 0; ci < chunks.Count; ci++)
+            {
+                var chunk = chunks[ci];
+                if (chunk.HeightsTex == null || chunk.Layers == null || chunk.Layers.Count == 0 ||
+                    chunk.BlendTextures == null || chunk.BlendTextures.Count == 0)
+                {
+                    result.Warnings.Add($"Chunk {chunk.ChunkName}: missing heights/layers/blends, skipped");
+                    continue;
+                }
+
+                int srcHeightRes = chunk.HeightsTex.width;
+                int heightRes = Mathf.Min(LargestPow2Plus1Ceil(srcHeightRes), maxResolution);
+                heightRes = Mathf.Max(33, heightRes);
+
+                float[,] heights = BuildLocalHeights(chunk, heightRes, hMin, sizeY);
+                int alphaRes = GuessChunkAlphamapResolution(chunk, heightRes);
+                float[,,] alphamaps = BuildLocalAlphamaps(chunk, alphaRes);
+                // Raw WoT control maps are NOT normalized.  Blender uses the exact
+                // A/G weights from terrain2/blend_textures in a sum chain. Unity
+                // TerrainData.SetAlphamaps normalizes weights, so those textures
+                // cannot be used for WoT rendering; they are only kept as fallback.
+                Texture2D[] rawControls = BuildRawControlTextures(chunk, alphaRes);
+                rawControls = SaveRawControlTextures(rawControls, outputPath, mapInfo.Name, chunk.ChunkName);
+
+                var td = new TerrainData
+                {
+                    heightmapResolution = heightRes,
+                    alphamapResolution = alphaRes,
+                    baseMapResolution = Mathf.Min(1024, alphaRes),
+                    size = new Vector3(terrain.ChunkSize, sizeY, terrain.ChunkSize),
+                    name = mapInfo.Name + "_" + chunk.ChunkName + "_TerrainData",
+                };
+
+                td.SetHeights(0, 0, heights);
+                td.terrainLayers = CreateTerrainLayers(chunk.Layers, resMgr, outputPath, chunk.ChunkName + "_");
+                td.SetAlphamaps(0, 0, alphamaps);
+                td.SetBaseMapDirty();
+                EditorUtility.SetDirty(td);
+
+                string tdPath = outputPath + "/TerrainData/" + td.name + ".asset";
+                var oldTd = AssetDatabase.LoadAssetAtPath<TerrainData>(tdPath);
+                if (oldTd != null) AssetDatabase.DeleteAsset(tdPath);
+                AssetDatabase.CreateAsset(td, tdPath);
+
+                var go = UnityEngine.Terrain.CreateTerrainGameObject(td);
+                go.name = chunk.ChunkName + "_Terrain";
+                // Heights were normalized as (worldHeight - hMin) / sizeY, so the
+                // Terrain object must be shifted down to hMin to restore WoT height.
+                go.transform.position = new Vector3(chunk.ChunkPos.x, hMin, chunk.ChunkPos.y);
+                go.transform.SetParent(root.transform, true);
+
+                var tc = go.GetComponent<UnityEngine.Terrain>();
+                if (tc != null)
+                {
+                    BindTerrainMaterial(tc, td, chunk.Layers, terrain, outputPath, mapInfo.Name, chunk.ChunkName, rawControls, globalMapTex);
+                    tc.basemapDistance = 100000f;
+                    tc.Flush();
+
+                    int hx = Mathf.RoundToInt(chunk.ChunkPos.x / terrain.ChunkSize);
+                    int hy = Mathf.RoundToInt(chunk.ChunkPos.y / terrain.ChunkSize);
+                    terrainByCoord[new Vector2Int(hx, hy)] = tc;
+                }
+
+                result.TerrainObjects.Add(go);
+                result.TerrainDatas.Add(td);
+                if (result.TerrainData == null) result.TerrainData = td;
+
+                if (ci < 6)
+                    LogChunkAlphamapStats(chunk, alphamaps);
             }
-            var ctx = new StitchContext
-            {
-                targetRes = targetRes,
-                minX = minX,
-                minY = minY,
-                worldSizeX = terrain.TotalSizeX,
-                worldSizeZ = terrain.TotalSizeZ,
-                chunkSize = terrain.ChunkSize,
-            };
 
-            // ---- Heights ----
-            float[,] heights = StitchHeights(chunks, ctx);
+            StitchTerrainNeighbours(terrainByCoord);
 
-            // ---- Collect unique global layers ----
-            var globalLayers = new List<TerrainLayerDef>();
-            var globalLayerIdx = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            AssetDatabase.SaveAssets();
+            string prefabPath = outputPath + "/" + root.name + ".prefab";
+            PrefabUtility.SaveAsPrefabAsset(root, prefabPath);
+
+            WoTLogger.Info($"Chunked terrain built: {result.TerrainObjects.Count}/{chunks.Count} Terrain chunks");
+            return result;
+        }
+
+        private static void ComputeGlobalHeightRange(List<TerrainChunk> chunks, out float min, out float max)
+        {
+            min = float.MaxValue;
+            max = float.MinValue;
             foreach (var chunk in chunks)
             {
-                foreach (var layer in chunk.Layers)
+                if (chunk.HeightsTex == null) continue;
+                var pixels = chunk.HeightsTex.GetPixels32();
+                var decoded = DecodeHeightPixels(pixels, chunk.HeightsTex.width, chunk.HeightsTex.height);
+                for (int i = 0; i < decoded.Length; i++)
                 {
-                    if (!globalLayerIdx.ContainsKey(layer.Name))
+                    float v = decoded[i];
+                    if (v < min) min = v;
+                    if (v > max) max = v;
+                }
+            }
+            if (min > max) { min = 0f; max = 1f; }
+        }
+
+        private static float[,] BuildLocalHeights(TerrainChunk chunk, int targetRes, float hMin, float sizeY)
+        {
+            int w = chunk.HeightsTex.width;
+            int h = chunk.HeightsTex.height;
+            var src = DecodeHeightPixels(chunk.HeightsTex.GetPixels32(), w, h);
+            var dst = new float[targetRes, targetRes];
+
+            for (int y = 0; y < targetRes; y++)
+            {
+                float pyF = (y / (float)(targetRes - 1)) * (h - 1);
+                int py0 = Mathf.Clamp(Mathf.FloorToInt(pyF), 0, h - 1);
+                int py1 = Mathf.Min(py0 + 1, h - 1);
+                float pyT = pyF - py0;
+                for (int x = 0; x < targetRes; x++)
+                {
+                    float pxF = (x / (float)(targetRes - 1)) * (w - 1);
+                    int px0 = Mathf.Clamp(Mathf.FloorToInt(pxF), 0, w - 1);
+                    int px1 = Mathf.Min(px0 + 1, w - 1);
+                    float pxT = pxF - px0;
+
+                    float h00 = src[py0 * w + px0];
+                    float h10 = src[py0 * w + px1];
+                    float h01 = src[py1 * w + px0];
+                    float h11 = src[py1 * w + px1];
+                    float hm = Mathf.Lerp(Mathf.Lerp(h00, h10, pxT), Mathf.Lerp(h01, h11, pxT), pyT);
+                    dst[y, x] = Mathf.Clamp01((hm - hMin) / sizeY);
+                }
+            }
+            return dst;
+        }
+
+        private static int GuessChunkAlphamapResolution(TerrainChunk chunk, int fallback)
+        {
+            int res = fallback;
+            if (chunk.BlendTextures != null && chunk.BlendTextures.Count > 0 && chunk.BlendTextures[0] != null)
+                res = Mathf.Max(chunk.BlendTextures[0].width, chunk.BlendTextures[0].height);
+            return Mathf.Clamp(res, 16, 2048);
+        }
+
+        private static float[,,] BuildLocalAlphamaps(TerrainChunk chunk, int alphaRes)
+        {
+            int layerCount = Mathf.Max(1, chunk.Layers.Count);
+            var maps = new float[alphaRes, alphaRes, layerCount];
+
+            for (int li = 0; li < chunk.Layers.Count; li++)
+            {
+                if (!TryGetBlendSource(chunk, li, out Texture2D weightTex, out int channel))
+                    continue;
+                if (weightTex == null) continue;
+
+                var pixels = weightTex.GetPixels32();
+                int w = weightTex.width;
+                int h = weightTex.height;
+
+                for (int y = 0; y < alphaRes; y++)
+                {
+                    float v = alphaRes == 1 ? 0f : y / (float)(alphaRes - 1);
+                    // Match Blender terrain_loader.py: blend texture is sampled via
+                    // Mapping Scale (1, -1, 1).  In local terrain UV this is 1-v.
+                    float pyF = (1f - v) * (h - 1);
+                    int py0 = Mathf.Clamp(Mathf.FloorToInt(pyF), 0, h - 1);
+                    int py1 = Mathf.Min(py0 + 1, h - 1);
+                    float pyT = pyF - py0;
+                    for (int x = 0; x < alphaRes; x++)
                     {
-                        globalLayerIdx[layer.Name] = globalLayers.Count;
-                        globalLayers.Add(layer);
+                        float u = alphaRes == 1 ? 0f : x / (float)(alphaRes - 1);
+                        float pxF = u * (w - 1);
+                        int px0 = Mathf.Clamp(Mathf.FloorToInt(pxF), 0, w - 1);
+                        int px1 = Mathf.Min(px0 + 1, w - 1);
+                        float pxT = pxF - px0;
+
+                        Color32 c00 = pixels[py0 * w + px0];
+                        Color32 c10 = pixels[py0 * w + px1];
+                        Color32 c01 = pixels[py1 * w + px0];
+                        Color32 c11 = pixels[py1 * w + px1];
+                        float weight = Mathf.Lerp(
+                            Mathf.Lerp(ChannelValue(c00, channel), ChannelValue(c10, channel), pxT),
+                            Mathf.Lerp(ChannelValue(c01, channel), ChannelValue(c11, channel), pxT),
+                            pyT);
+                        maps[y, x, li] = Mathf.Clamp01(weight);
                     }
                 }
             }
-            WoTLogger.Info($"Found {globalLayers.Count} unique terrain layers");
 
-            // ---- Splat data (Unity expects [numLayers, res, res]) ----
-            int totalLayerCount = globalLayers.Count;
-            // Per-layer weight storage. globalSplat[layerIdx][y, x]
-            float[][,] globalSplat = new float[totalLayerCount][,];
-            for (int i = 0; i < totalLayerCount; i++)
-                globalSplat[i] = new float[targetRes, targetRes];
-
-            foreach (var chunk in chunks)
-                FillChunkSplat(chunk, globalLayers, globalLayerIdx, globalSplat, ctx);
-
-            // Diagnostic: how much total weight landed in each layer? If only one
-            // layer has non-zero weight, the blend mapping/decoding is wrong.
-            for (int li = 0; li < totalLayerCount; li++)
+            // Unity wants weights per pixel normalized to sum=1.
+            for (int y = 0; y < alphaRes; y++)
             {
-                double sum = 0; float mx = 0;
-                for (int y = 0; y < targetRes; y++)
-                    for (int x = 0; x < targetRes; x++)
-                    { float v = globalSplat[li][y, x]; sum += v; if (v > mx) mx = v; }
-                WoTLogger.Info($"  splat layer {li} ({Path.GetFileName(globalLayers[li].Name)}): " +
-                               $"sumWeight={sum:F0} maxWeight={mx:F3}");
-            }
-
-            // Convert to Unity's alphamap layout. IMPORTANT: Unity expects
-            // float[height, width, numLayers] - the LAYER index is the LAST
-            // dimension, not the first. Using [numLayers, res, res] makes
-            // SetAlphamaps throw "Float array size wrong (layers should be N)".
-            // We also normalize the weights per pixel so they sum to 1 (Unity
-            // requirement for correct blending).
-            var splatForUnity = new float[targetRes, targetRes, totalLayerCount];
-            for (int y = 0; y < targetRes; y++)
-            {
-                for (int x = 0; x < targetRes; x++)
+                for (int x = 0; x < alphaRes; x++)
                 {
                     float sum = 0f;
-                    for (int li = 0; li < totalLayerCount; li++)
-                        sum += globalSplat[li][y, x];
-
+                    for (int li = 0; li < layerCount; li++) sum += maps[y, x, li];
                     if (sum > 1e-6f)
                     {
-                        for (int li = 0; li < totalLayerCount; li++)
-                            splatForUnity[y, x, li] = globalSplat[li][y, x] / sum;
+                        for (int li = 0; li < layerCount; li++) maps[y, x, li] /= sum;
                     }
                     else
                     {
-                        // No weight anywhere -> dump everything into layer 0 so the
-                        // terrain isn't transparent/black.
-                        splatForUnity[y, x, 0] = 1f;
+                        maps[y, x, 0] = 1f;
                     }
                 }
             }
 
-            // ---- Create TerrainData ----
-            // Heights are currently in METRES. Unity's SetHeights expects values
-            // normalized to [0,1] relative to TerrainData.size.y; anything > 1 is
-            // clamped to 1 (which is what made the terrain a flat plateau before).
-            ComputeHeightMinMax(heights, out float hMin, out float hMax);
-            float heightRange = Mathf.Max(hMax - hMin, 1f);
-            // Add a little headroom so the highest point isn't exactly at 1.0.
-            float sizeY = heightRange * 1.05f;
+            return maps;
+        }
 
-            for (int y = 0; y < targetRes; y++)
-                for (int x = 0; x < targetRes; x++)
-                    heights[y, x] = Mathf.Clamp01((heights[y, x] - hMin) / sizeY);
+        private static Texture2D[] BuildRawControlTextures(TerrainChunk chunk, int alphaRes)
+        {
+            int layerCount = Mathf.Max(1, chunk.Layers.Count);
+            int controlCount = Mathf.Clamp((layerCount + 3) / 4, 1, 4);
+            var pixels = new Color32[controlCount][];
+            for (int i = 0; i < controlCount; i++)
+                pixels[i] = new Color32[alphaRes * alphaRes];
 
-            var td = new TerrainData
+            for (int li = 0; li < chunk.Layers.Count && li < 16; li++)
             {
-                heightmapResolution = targetRes,
-                alphamapResolution = targetRes,
-                baseMapResolution = Mathf.Min(1024, targetRes),
-                size = new Vector3(terrain.TotalSizeX, sizeY, terrain.TotalSizeZ),
-                name = mapInfo.Name + "_TerrainData",
-            };
-            td.SetHeights(0, 0, heights);
-            WoTLogger.Info($"Heights: min={hMin:F1}m max={hMax:F1}m range={heightRange:F1}m, " +
-                           $"terrain size=({terrain.TotalSizeX:F0}, {sizeY:F1}, {terrain.TotalSizeZ:F0})");
+                if (!TryGetBlendSource(chunk, li, out Texture2D weightTex, out int channel))
+                    continue;
+                if (weightTex == null) continue;
 
-            if (totalLayerCount > 0)
-            {
-                // terrainLayers must be assigned BEFORE SetAlphamaps so that
-                // alphamapLayers matches splatForUnity's 3rd dimension.
-                td.terrainLayers = CreateTerrainLayers(globalLayers, resMgr, outputPath);
-                td.SetAlphamaps(0, 0, splatForUnity); // splatForUnity is [y, x, layer]
+                var srcPixels = weightTex.GetPixels32();
+                int w = weightTex.width;
+                int h = weightTex.height;
+                int ci = li / 4;
+                int ch = li % 4;
 
-                // Read back what Unity actually stored, to prove the alphamap is
-                // multi-layer (and not collapsed to layer 0).
-                var check = td.GetAlphamaps(0, 0, td.alphamapWidth, td.alphamapHeight);
-                var layerCoverage = new double[totalLayerCount];
-                int cw = check.GetLength(1), ch = check.GetLength(0);
-                int cl = check.GetLength(2);
-                for (int y = 0; y < ch; y++)
-                    for (int x = 0; x < cw; x++)
-                        for (int li = 0; li < cl; li++)
-                            layerCoverage[li] += check[y, x, li];
-                var sb = new System.Text.StringBuilder();
-                for (int li = 0; li < totalLayerCount; li++)
-                    sb.Append($"{li}:{layerCoverage[li]:F0} ");
-                WoTLogger.Info($"TerrainData alphamap readback ({cw}x{ch}x{cl}) coverage per layer: {sb}");
-            }
-
-            // ---- Save assets ----
-            EnsureFolder(outputPath);
-            string assetPath = outputPath + "/" + td.name + ".asset";
-            AssetDatabase.CreateAsset(td, assetPath);
-
-            var go = UnityEngine.Terrain.CreateTerrainGameObject(td);
-            go.name = mapInfo.Name + "_Terrain";
-
-            // Make Unity rebuild the composite/basemap so the painted layers show
-            // up immediately (the basemap is what you see at a distance; without a
-            // flush it can display just layer 0).
-            var terrainComp = go.GetComponent<UnityEngine.Terrain>();
-            if (terrainComp != null)
-            {
-                // Use our custom multilayer terrain shader so all N layers render
-                // in a single pass (URP's default Terrain/Lit only shows 4).
-                var shader = Shader.Find("WoT/TerrainMultilayer");
-                if (shader != null)
+                for (int y = 0; y < alphaRes; y++)
                 {
-                    var mat = new Material(shader) { name = mapInfo.Name + "_TerrainMat" };
-                    mat.SetFloat("_NumLayers", totalLayerCount);
+                    float v = alphaRes == 1 ? 0f : y / (float)(alphaRes - 1);
+                    // Blender mapping_node Scale=(1,-1,1), so blend V is flipped.
+                    float pyF = (1f - v) * (h - 1);
+                    int py0 = Mathf.Clamp(Mathf.FloorToInt(pyF), 0, h - 1);
+                    int py1 = Mathf.Min(py0 + 1, h - 1);
+                    float pyT = pyF - py0;
 
-                    // IMPORTANT: Unity only auto-binds _Control*/_Splat* to the
-                    // built-in terrain shader. For a custom material we must wire
-                    // them up by hand from the TerrainData.
-                    var alphaTextures = td.alphamapTextures; // each RGBA = 4 layer weights
-                    WoTLogger.Info($"Binding {alphaTextures.Length} control textures, {td.terrainLayers.Length} splat layers");
-                    for (int ci = 0; ci < alphaTextures.Length && ci < 4; ci++)
-                        mat.SetTexture("_Control" + ci, alphaTextures[ci]);
-
-                    var tlayers = td.terrainLayers;
-                    for (int li = 0; li < tlayers.Length && li < 16; li++)
+                    for (int x = 0; x < alphaRes; x++)
                     {
-                        mat.SetTexture("_Splat" + li, tlayers[li].diffuseTexture);
-                        // Terrain UV is 0..1 across the whole terrain; convert the
-                        // layer's metric tileSize into a UV-space tiling factor.
-                        Vector2 ts = tlayers[li].tileSize;
-                        float tilesX = ts.x > 0.001f ? terrain.TotalSizeX / ts.x : 1f;
-                        float tilesY = ts.y > 0.001f ? terrain.TotalSizeZ / ts.y : 1f;
-                        mat.SetVector("_Splat" + li + "_ST", new Vector4(tilesX, tilesY, 0f, 0f));
+                        float u = alphaRes == 1 ? 0f : x / (float)(alphaRes - 1);
+                        float pxF = u * (w - 1);
+                        int px0 = Mathf.Clamp(Mathf.FloorToInt(pxF), 0, w - 1);
+                        int px1 = Mathf.Min(px0 + 1, w - 1);
+                        float pxT = pxF - px0;
+
+                        Color32 c00 = srcPixels[py0 * w + px0];
+                        Color32 c10 = srcPixels[py0 * w + px1];
+                        Color32 c01 = srcPixels[py1 * w + px0];
+                        Color32 c11 = srcPixels[py1 * w + px1];
+                        float weight = Mathf.Lerp(
+                            Mathf.Lerp(ChannelValue(c00, channel), ChannelValue(c10, channel), pxT),
+                            Mathf.Lerp(ChannelValue(c01, channel), ChannelValue(c11, channel), pxT),
+                            pyT);
+                        byte b = (byte)Mathf.Clamp(Mathf.RoundToInt(weight * 255f), 0, 255);
+
+                        int pi = y * alphaRes + x;
+                        var dst = pixels[ci][pi];
+                        switch (ch)
+                        {
+                            case 0: dst.r = b; break;
+                            case 1: dst.g = b; break;
+                            case 2: dst.b = b; break;
+                            case 3: dst.a = b; break;
+                        }
+                        pixels[ci][pi] = dst;
                     }
-
-                    terrainComp.materialTemplate = mat;
-
-                    string matPath = outputPath + "/" + mat.name + ".mat";
-                    var existingMat = AssetDatabase.LoadAssetAtPath<Material>(matPath);
-                    if (existingMat != null) AssetDatabase.DeleteAsset(matPath);
-                    AssetDatabase.CreateAsset(mat, matPath);
-                    WoTLogger.Info($"Terrain uses custom multilayer shader ({totalLayerCount} layers in one pass)");
                 }
-                else
-                {
-                    // Fallback: pipeline default (shows 4 layers on URP).
-                    var rp = UnityEngine.Rendering.GraphicsSettings.currentRenderPipeline
-                             ?? UnityEngine.Rendering.GraphicsSettings.defaultRenderPipeline;
-                    var pipelineMat = rp != null ? rp.defaultTerrainMaterial : null;
-                    if (pipelineMat != null) terrainComp.materialTemplate = pipelineMat;
-                    WoTLogger.Warn("WoT/TerrainMultilayer shader not found; using pipeline default (max 4 visible layers)");
-                }
-                terrainComp.basemapDistance = 100000f; // always use real layers
-                terrainComp.Flush();
             }
-            td.SetBaseMapDirty();
-            EditorUtility.SetDirty(td);
-            AssetDatabase.SaveAssets();
 
-            string prefabPath = outputPath + "/" + go.name + ".prefab";
-            PrefabUtility.SaveAsPrefabAsset(go, prefabPath);
-
-            return new BuildResult
+            var textures = new Texture2D[controlCount];
+            for (int ci = 0; ci < controlCount; ci++)
             {
-                TerrainObject = go,
-                TerrainData = td,
-            };
+                var tex = new Texture2D(alphaRes, alphaRes, TextureFormat.RGBA32, false, true)
+                {
+                    name = chunk.ChunkName + "_WoTRawControl" + ci,
+                    wrapMode = TextureWrapMode.Clamp,
+                    filterMode = FilterMode.Bilinear,
+                };
+                tex.SetPixels32(pixels[ci]);
+                tex.Apply(false, false);
+                textures[ci] = tex;
+            }
+            return textures;
+        }
+
+        private static Texture2D[] SaveRawControlTextures(Texture2D[] controls, string outputPath, string mapName, string chunkName)
+        {
+            if (controls == null) return null;
+            string folder = outputPath + "/Controls";
+            EnsureFolder(folder);
+            for (int i = 0; i < controls.Length; i++)
+            {
+                if (controls[i] == null) continue;
+                controls[i].name = mapName + "_" + chunkName + "_RawControl" + i;
+                string path = folder + "/" + controls[i].name + ".asset";
+                var old = AssetDatabase.LoadAssetAtPath<Texture2D>(path);
+                if (old != null) AssetDatabase.DeleteAsset(path);
+                AssetDatabase.CreateAsset(controls[i], path);
+                var persisted = AssetDatabase.LoadAssetAtPath<Texture2D>(path);
+                if (persisted != null) controls[i] = persisted;
+            }
+            return controls;
+        }
+
+        private static bool TryGetBlendSource(TerrainChunk chunk, int layerIndex, out Texture2D tex, out int channel)
+        {
+            tex = null;
+            channel = 0;
+            if (chunk.IsNewBlendFormat)
+            {
+                int blendIdx = layerIndex / 2;
+                if (blendIdx >= chunk.BlendTextures.Count) return false;
+                tex = chunk.BlendTextures[blendIdx];
+                // Blender: Alpha for even layers, Green for odd layers.
+                channel = (layerIndex % 2 == 0) ? 3 : 1;
+                return true;
+            }
+            else
+            {
+                if (layerIndex >= chunk.BlendTextures.Count) return false;
+                tex = chunk.BlendTextures[layerIndex];
+                // Old blend was RGB color mask. Unity alphamap is scalar; Red is
+                // the closest equivalent to the previous importer and works for
+                // grayscale masks.
+                channel = 0;
+                return true;
+            }
+        }
+
+        private static Texture2D LoadGlobalMapTexture(UniversalTerrain terrain, WoTPackageManager resMgr, string outputPath)
+        {
+            if (terrain == null || string.IsNullOrEmpty(terrain.GlobalMap))
+                return null;
+
+            byte[] data = resMgr.ReadBytes(terrain.GlobalMap) ?? TryAlternatePaths(resMgr, terrain.GlobalMap);
+            if (data == null)
+            {
+                WoTLogger.Warn($"Global terrain AM map not found: {terrain.GlobalMap}");
+                return null;
+            }
+
+            // Blender sets global_AM colorspace to Non-Color, so load linear=true.
+            Texture2D tex = LoadTexture(data, terrain.GlobalMap, true);
+            if (tex == null)
+            {
+                WoTLogger.Warn($"Global terrain AM decode failed: {terrain.GlobalMap}");
+                return null;
+            }
+
+            string folder = outputPath + "/Textures";
+            EnsureFolder(folder);
+            tex.name = "WoT_GlobalAM_" + Path.GetFileNameWithoutExtension(terrain.GlobalMap);
+            string path = folder + "/" + tex.name + ".asset";
+            var old = AssetDatabase.LoadAssetAtPath<Texture2D>(path);
+            if (old != null) AssetDatabase.DeleteAsset(path);
+            AssetDatabase.CreateAsset(tex, path);
+            var persisted = AssetDatabase.LoadAssetAtPath<Texture2D>(path);
+            WoTLogger.Info($"Loaded global terrain AM map: {terrain.GlobalMap}");
+            return persisted != null ? persisted : tex;
+        }
+
+        private static void BindTerrainMaterial(UnityEngine.Terrain terrainComp, TerrainData td, List<TerrainLayerDef> layerDefs, UniversalTerrain terrainInfo, string outputPath, string mapName, string chunkName, Texture2D[] rawControls, Texture2D globalMapTex)
+        {
+            var shader = Shader.Find("WoT/TerrainMultilayer");
+            if (shader == null)
+            {
+                var rp = UnityEngine.Rendering.GraphicsSettings.currentRenderPipeline
+                         ?? UnityEngine.Rendering.GraphicsSettings.defaultRenderPipeline;
+                var pipelineMat = rp != null ? rp.defaultTerrainMaterial : null;
+                if (pipelineMat != null) terrainComp.materialTemplate = pipelineMat;
+                WoTLogger.Warn("WoT/TerrainMultilayer shader not found; using pipeline default terrain material");
+                return;
+            }
+
+            var mat = new Material(shader) { name = mapName + "_" + chunkName + "_TerrainMat" };
+            int layerCount = td.terrainLayers != null ? td.terrainLayers.Length : 0;
+            mat.SetFloat("_NumLayers", Mathf.Min(layerCount, 16));
+
+            // Use raw WoT control textures, not TerrainData.alphamapTextures.
+            // TerrainData alphamaps are normalized by Unity, while WoT/Blender uses
+            // original non-normalized blend weights.
+            var controlTextures = rawControls != null && rawControls.Length > 0 ? rawControls : td.alphamapTextures;
+            for (int i = 0; i < controlTextures.Length && i < 4; i++)
+                mat.SetTexture("_Control" + i, controlTextures[i]);
+
+            if (globalMapTex != null)
+            {
+                mat.SetTexture("_GlobalMap", globalMapTex);
+                mat.SetFloat("_UseGlobalMap", 1f);
+                mat.SetVector("_GlobalMap_ST", new Vector4(1f, 1f, 0f, 0f));
+                mat.SetVector("_TerrainGlobal", new Vector4(
+                    terrainInfo.MinX * terrainInfo.ChunkSize,
+                    terrainInfo.MinY * terrainInfo.ChunkSize,
+                    Mathf.Max(terrainInfo.TotalSizeX, 1f),
+                    Mathf.Max(terrainInfo.TotalSizeZ, 1f)));
+            }
+            else
+            {
+                mat.SetFloat("_UseGlobalMap", 0f);
+            }
+
+            var tlayers = td.terrainLayers;
+            var layerU = new Vector4[16];
+            var layerV = new Vector4[16];
+            for (int li = 0; tlayers != null && li < tlayers.Length && li < 16; li++)
+            {
+                mat.SetTexture("_Splat" + li, tlayers[li].diffuseTexture);
+
+                // Keep _ST as identity; WoT tile UVs are calculated in the shader
+                // from world position and the original BigWorld u/v projections.
+                mat.SetVector("_Splat" + li + "_ST", new Vector4(1f, 1f, 0f, 0f));
+
+                // TerrainData only stores Unity TerrainLayer assets, so use the
+                // parallel chunk.Layers list passed into this method.
+            }
+            for (int li = 0; layerDefs != null && li < layerDefs.Count && li < 16; li++)
+            {
+                layerU[li] = layerDefs[li].UProjection;
+                layerV[li] = layerDefs[li].VProjection;
+            }
+            // Fill unused slots with a harmless 1:1 mapping to avoid undefined data.
+            for (int li = layerDefs != null ? Mathf.Min(layerDefs.Count, 16) : 0; li < 16; li++)
+            {
+                layerU[li] = new Vector4(1f, 0f, 0f, 0f);
+                layerV[li] = new Vector4(0f, 0f, 1f, 0f);
+            }
+            mat.SetVectorArray("_LayerU", layerU);
+            mat.SetVectorArray("_LayerV", layerV);
+
+            terrainComp.materialTemplate = mat;
+            string matFolder = outputPath + "/Materials";
+            EnsureFolder(matFolder);
+            string matPath = matFolder + "/" + mat.name + ".mat";
+            var old = AssetDatabase.LoadAssetAtPath<Material>(matPath);
+            if (old != null) AssetDatabase.DeleteAsset(matPath);
+            AssetDatabase.CreateAsset(mat, matPath);
+        }
+
+        private static void StitchTerrainNeighbours(Dictionary<Vector2Int, UnityEngine.Terrain> terrains)
+        {
+            foreach (var kv in terrains)
+            {
+                var c = kv.Key;
+                terrains.TryGetValue(new Vector2Int(c.x - 1, c.y), out var left);
+                terrains.TryGetValue(new Vector2Int(c.x, c.y + 1), out var top);
+                terrains.TryGetValue(new Vector2Int(c.x + 1, c.y), out var right);
+                terrains.TryGetValue(new Vector2Int(c.x, c.y - 1), out var bottom);
+                kv.Value.SetNeighbors(left, top, right, bottom);
+            }
+        }
+
+        private static void LogChunkAlphamapStats(TerrainChunk chunk, float[,,] maps)
+        {
+            int h = maps.GetLength(0), w = maps.GetLength(1), l = maps.GetLength(2);
+            var sb = new System.Text.StringBuilder();
+            for (int li = 0; li < l; li++)
+            {
+                double sum = 0;
+                float max = 0;
+                for (int y = 0; y < h; y++)
+                    for (int x = 0; x < w; x++)
+                    {
+                        float v = maps[y, x, li];
+                        sum += v;
+                        if (v > max) max = v;
+                    }
+                sb.Append($"{li}:{sum:F0}/{max:F2} ");
+            }
+            WoTLogger.Info($"  chunk {chunk.ChunkName}: alphamap {w}x{h} layers={l} weights {sb}");
         }
 
         // ====================== HEIGHTS ======================
@@ -483,7 +769,8 @@ namespace WoTMapImporter.Editor.Terrain
         private static TerrainLayer[] CreateTerrainLayers(
             List<TerrainLayerDef> layers,
             WoTPackageManager resMgr,
-            string outputPath)
+            string outputPath,
+            string assetPrefix = "")
         {
             var result = new TerrainLayer[layers.Count];
             string texFolder = outputPath + "/Textures";
@@ -497,7 +784,7 @@ namespace WoTMapImporter.Editor.Terrain
                 var l = layers[i];
                 // Use the index in the asset name so two layers that share a base
                 // filename don't overwrite each other's assets.
-                string safeBase = $"{i:D2}_" + Path.GetFileNameWithoutExtension(l.Name);
+                string safeBase = assetPrefix + $"{i:D2}_" + Path.GetFileNameWithoutExtension(l.Name);
                 var tl = new TerrainLayer
                 {
                     name = "WoTLayer_" + safeBase,
