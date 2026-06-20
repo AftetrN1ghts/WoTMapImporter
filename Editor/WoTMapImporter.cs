@@ -104,6 +104,21 @@ namespace WoTMapImporter.Editor
                 if (buildResult.TerrainObject != null)
                     buildResult.TerrainObject.transform.SetParent(root.transform, false);
 
+                // ---- Static objects (from compiled space.bin) ----
+                if (settings.LoadObjects)
+                {
+                    try
+                    {
+                        progress?.Invoke(0.93f, "Loading static objects...");
+                        LoadStaticObjects(spaceDir, $"{outputFolder}/{mapInfo.Name}", pkgMgr, root, result);
+                    }
+                    catch (Exception oe)
+                    {
+                        WoTLogger.Warn($"Static object loading failed: {oe.Message}\n{oe.StackTrace}");
+                        result.Warnings.Add("Object loading failed: " + oe.Message);
+                    }
+                }
+
                 result.Root = root;
                 string prefabPath = $"{folder}/WoTMap_{mapInfo.Name}.prefab";
                 PrefabUtility.SaveAsPrefabAsset(root, prefabPath);
@@ -246,19 +261,32 @@ namespace WoTMapImporter.Editor
             }
 
             // Diagnostic: dump the contents of spaceDir so we know what's there.
-            WoTLogger.Info($"=== Contents of {spaceDir} (first 30 files) ===");
+            WoTLogger.Info($"=== Contents of {spaceDir} (first 40 files) ===");
             try
             {
                 var allFiles = Directory.GetFiles(spaceDir, "*", SearchOption.AllDirectories);
                 WoTLogger.Info($"Total files: {allFiles.Length}");
-                for (int i = 0; i < Math.Min(30, allFiles.Length); i++)
+                for (int i = 0; i < Math.Min(40, allFiles.Length); i++)
                 {
                     string rel = allFiles[i].Substring(spaceDir.Length + 1).Replace('\\', '/');
                     long size = new FileInfo(allFiles[i]).Length;
                     WoTLogger.Info($"  [{size,8} B] {rel}");
                 }
-                if (allFiles.Length > 30)
-                    WoTLogger.Info($"  ... and {allFiles.Length - 30} more");
+                if (allFiles.Length > 40)
+                    WoTLogger.Info($"  ... and {allFiles.Length - 40} more");
+
+                // Summary of file extensions present - this is the single most useful
+                // line for diagnosing "No terrain chunks found".
+                var extCounts = allFiles
+                    .GroupBy(f =>
+                    {
+                        string n = Path.GetFileName(f);
+                        int firstDot = n.IndexOf('.');
+                        return firstDot >= 0 ? n.Substring(firstDot).ToLowerInvariant() : "(no ext)";
+                    })
+                    .OrderByDescending(g => g.Count())
+                    .Select(g => $"{g.Key} x{g.Count()}");
+                WoTLogger.Info($"Extension histogram: {string.Join(", ", extCounts)}");
             }
             catch (Exception e)
             {
@@ -334,7 +362,7 @@ namespace WoTMapImporter.Editor
                 WoTLogger.Info($"Discovered terrain bounds from cdata: x[{minX}..{maxX}] y[{minY}..{maxY}]");
             }
 
-            int idx = 0;
+            int skippedTooSmall = 0, skippedNull = 0, skippedException = 0;
             foreach (var path in cdataPaths)
             {
                 string baseName = Path.GetFileName(path);
@@ -344,34 +372,140 @@ namespace WoTMapImporter.Editor
                 try
                 {
                     byte[] data = File.ReadAllBytes(path);
-                    if (data.Length < 4) continue;
+                    if (data.Length < 4) { skippedTooSmall++; continue; }
 
                     var chunk = TerrainChunkDecoder.Decode(data, baseName, chunkPos);
                     if (chunk != null)
                         chunks.Add(chunk);
+                    else
+                        skippedNull++;
                 }
                 catch (Exception e)
                 {
+                    skippedException++;
                     WoTLogger.Warn($"Failed to decode chunk {baseName}: {e.Message}");
                 }
-
-                idx++;
             }
-            WoTLogger.Info($"Loaded {chunks.Count}/{cdataPaths.Length} terrain chunks");
+            WoTLogger.Info($"Loaded {chunks.Count}/{cdataPaths.Length} terrain chunks " +
+                           $"(skipped: {skippedNull} null, {skippedException} errors, {skippedTooSmall} too small)");
+            if (chunks.Count == 0 && cdataPaths.Length > 0)
+            {
+                WoTLogger.Error(
+                    "Found .cdata files but decoded 0 chunks. The most common reason on modern " +
+                    "clients is that the chunks are NOT plain ZIP archives (processed/packed format). " +
+                    "Check the 'Decoding chunk ... isZip=' lines above.");
+            }
             return chunks;
+        }
+
+        // =================== STATIC OBJECTS ===================
+
+        private static void LoadStaticObjects(
+            string spaceDir, string outputPath, WoTPackageManager pkgMgr,
+            GameObject root, ImportResult result)
+        {
+            string spaceBinPath = Path.Combine(spaceDir, "space.bin");
+            if (!File.Exists(spaceBinPath))
+            {
+                WoTLogger.Warn("space.bin not found; skipping static objects (old-format spaces not supported yet)");
+                return;
+            }
+
+            byte[] bin = File.ReadAllBytes(spaceBinPath);
+            var space = Package.CompiledSpace.Parse(bin);
+            if (space.Models.Count == 0)
+            {
+                WoTLogger.Warn("CompiledSpace produced 0 model instances");
+                return;
+            }
+
+            // Group instances by prims file so we decode each mesh only once.
+            var byPrims = new Dictionary<string, List<Package.CompiledSpace.ModelInstance>>(StringComparer.OrdinalIgnoreCase);
+            foreach (var m in space.Models)
+            {
+                if (string.IsNullOrEmpty(m.PrimsName)) continue;
+                if (!byPrims.TryGetValue(m.PrimsName, out var list))
+                    byPrims[m.PrimsName] = list = new List<Package.CompiledSpace.ModelInstance>();
+                list.Add(m);
+            }
+
+            var objectsRoot = new GameObject("StaticObjects");
+            objectsRoot.transform.SetParent(root.transform, false);
+
+            int built = 0, failed = 0, instances = 0;
+            foreach (var kv in byPrims)
+            {
+                string primsName = kv.Key;
+                var insts = kv.Value;
+
+                // Use the first instance's verts/prims data-section names + diffuse.
+                var first = insts[0];
+                var transforms = new List<Mesh.ObjectBuilder.ObjectTransform>();
+                foreach (var m in insts)
+                {
+                    var t = m.Transform;
+                    transforms.Add(new Mesh.ObjectBuilder.ObjectTransform
+                    {
+                        Row0 = new Vector4(t[0], t[1], t[2], t[3]),
+                        Row1 = new Vector4(t[4], t[5], t[6], t[7]),
+                        Row2 = new Vector4(t[8], t[9], t[10], t[11]),
+                        Row3 = new Vector4(t[12], t[13], t[14], t[15]),
+                    });
+                }
+
+                var texPaths = new List<string>();
+                if (!string.IsNullOrEmpty(first.DiffuseTexture))
+                    texPaths.Add(first.DiffuseTexture);
+
+                try
+                {
+                    var br = Mesh.ObjectBuilder.Build(outputPath, primsName,
+                        first.VertsDataName, transforms, texPaths, pkgMgr);
+                    if (br.Root != null)
+                    {
+                        br.Root.transform.SetParent(objectsRoot.transform, false);
+                        built++;
+                        instances += insts.Count;
+                    }
+                    else
+                    {
+                        failed++;
+                        if (br.Warnings.Count > 0) WoTLogger.Warn(br.Warnings[0]);
+                    }
+                }
+                catch (Exception e)
+                {
+                    failed++;
+                    WoTLogger.Warn($"Object build failed for {primsName}: {e.Message}");
+                }
+            }
+
+            WoTLogger.Info($"Static objects: {built} models built ({instances} instances), {failed} failed, " +
+                           $"{byPrims.Count} unique prims");
+            result.Warnings.Add($"Objects: {built} models / {instances} instances");
         }
 
         private static void ParseChunkName(string name, out int hexX, out int hexY)
         {
-            string baseName = Path.GetFileNameWithoutExtension(name);
+            // A chunk file is named like "XXXXYYYY.cdata" / "XXXXYYYYo.cdata_processed".
+            // We only care about the first 8 hex chars (matches Blender: chunk_name = item.name[:8]).
+            // Strip every extension first (the file may have a double extension).
+            string baseName = name;
+            int dot = baseName.IndexOf('.');
+            if (dot >= 0) baseName = baseName.Substring(0, dot);
+
             hexX = 0; hexY = 0;
             if (baseName.Length < 8) return;
             try
             {
+                // NOTE: Substring's 2nd arg is LENGTH, not end index. Both halves are 4 chars.
                 hexX = unchecked((short)Convert.ToInt32(baseName.Substring(0, 4), 16));
-                hexY = unchecked((short)Convert.ToInt32(baseName.Substring(4, 8), 16));
+                hexY = unchecked((short)Convert.ToInt32(baseName.Substring(4, 4), 16));
             }
-            catch { }
+            catch (Exception e)
+            {
+                WoTLogger.Warn($"ParseChunkName failed for '{name}' (base '{baseName}'): {e.Message}");
+            }
         }
     }
 }

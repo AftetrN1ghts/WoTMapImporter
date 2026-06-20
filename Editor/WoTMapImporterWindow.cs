@@ -257,6 +257,24 @@ namespace WoTMapImporter.Editor
                 _status = "res/packages not found";
                 return;
             }
+
+            // The map list only fills Name/LocalizedName. We must read the per-map
+            // arena_defs/<map>.xml to get the real geometry path + bounding box,
+            // otherwise we silently fall back to "spaces/<name>" and lose bounds.
+            try
+            {
+                using var infoMgr = new WoTPackageManager(wotResPath, new[] { "scripts.pkg" });
+                var full = MapListParser.ParseMapInfo(infoMgr, mapInfo.Name);
+                full.LocalizedName = mapInfo.LocalizedName;
+                mapInfo = full;
+                WoTLogger.Info($"Map info: name={mapInfo.Name} geometry='{mapInfo.Geometry}' " +
+                               $"bl={mapInfo.BottomLeft} ur={mapInfo.UpperRight}");
+            }
+            catch (System.Exception e)
+            {
+                WoTLogger.Warn($"Could not read arena_defs/{mapInfo.Name}.xml " +
+                               $"(falling back to spaces/{mapInfo.Name}): {e.Message}");
+            }
             _isImporting = true;
             try
             {

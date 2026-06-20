@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using UnityEngine;
+using WoTMapImporter.Editor.Utils;
 
 namespace WoTMapImporter.Editor.Image
 {
@@ -34,15 +35,27 @@ namespace WoTMapImporter.Editor.Image
             using var ms = new MemoryStream(data, false);
             using var br = new BinaryReader(ms);
             br.ReadUInt32(); // magic
+            uint size = br.ReadUInt32();
+            uint flags = br.ReadUInt32();
+            uint height = br.ReadUInt32();
+            uint width = br.ReadUInt32();
+            uint pitch = br.ReadUInt32();
+            uint depth = br.ReadUInt32();
+            uint mip = br.ReadUInt32();
+            // DDS_HEADER has dwReserved1[11] (44 bytes) between dwMipMapCount and
+            // the pixel-format struct. This block was missing before, which made
+            // every subsequent field (PfFourCC etc.) read 44 bytes too early and
+            // produced "Unsupported DDS FourCC: \0\0\0" / garbage.
+            for (int r = 0; r < 11; r++) br.ReadUInt32();
             header = new Header
             {
-                Size = br.ReadUInt32(),
-                Flags = br.ReadUInt32(),
-                Height = br.ReadUInt32(),
-                Width = br.ReadUInt32(),
-                PitchOrLinearSize = br.ReadUInt32(),
-                Depth = br.ReadUInt32(),
-                MipMapCount = br.ReadUInt32(),
+                Size = size,
+                Flags = flags,
+                Height = height,
+                Width = width,
+                PitchOrLinearSize = pitch,
+                Depth = depth,
+                MipMapCount = mip,
                 PfSize = br.ReadUInt32(),
                 PfFlags = br.ReadUInt32(),
                 PfFourCC = br.ReadUInt32(),
@@ -56,57 +69,158 @@ namespace WoTMapImporter.Editor.Image
         }
 
         /// <summary>Reads DXT5 (or DXT1) texture as Texture2D (RGBA32).</summary>
-        public static Texture2D Read(byte[] data, string name)
+        public static Texture2D Read(byte[] data, string name, bool linear = true)
         {
             if (!TryReadHeader(data, out var header))
                 throw new Exception("Not a DDS file");
 
-            // Strip 128-byte header
+            int dataOffset = (int)header.Size + 4;        // 4-byte magic + header.Size
+            if (dataOffset + 4 > data.Length) dataOffset = 128;
+
+            int w = (int)header.Width, h = (int)header.Height;
+            string fourcc = FourCCToString(header.PfFourCC);
+
+            // Detect DX10 extended header (FourCC 'DX10' = 0x30315844). The real
+            // DXGI format follows the 124-byte header (20 extra bytes).
+            if (fourcc == "DX10")
+            {
+                uint dxgiFormat = BitConverter.ToUInt32(data, 128); // first field of DDS_HEADER_DXT10
+                dataOffset = 148;                                   // 4 + 124 + 20
+                var fmt10 = DxgiToUnity(dxgiFormat);
+                if (fmt10 != (TextureFormat)0)
+                    return BuildCompressed(data, dataOffset, w, h, fmt10, name, linear);
+                WoTLogger.Warn($"DDS {name}: unsupported DXGI format {dxgiFormat}, falling back");
+            }
+
+            // Classic FourCC formats - hand them to Unity's native block decoder
+            // via LoadRawTextureData (far more reliable than manual block decode).
+            TextureFormat tf = fourcc switch
+            {
+                "DXT1" => TextureFormat.DXT1,
+                "DXT5" => TextureFormat.DXT5,
+                "ATI2" or "BC5U" => TextureFormat.BC5,
+                "BC4U" or "ATI1" => TextureFormat.BC4,
+                _ => (TextureFormat)0,
+            };
+
+            if (tf != (TextureFormat)0)
+                return BuildCompressed(data, dataOffset, w, h, tf, name, linear);
+
+            // Uncompressed RGBA/BGRA fallback.
+            if (header.PfRGBBitCount == 32)
+                return BuildUncompressed32(data, dataOffset, w, h, header, name, linear);
+
+            throw new Exception($"Unsupported DDS FourCC: '{fourcc}' (bitcount={header.PfRGBBitCount})");
+        }
+
+        private static Texture2D BuildCompressed(
+            byte[] data, int dataOffset, int w, int h, TextureFormat fmt, string name, bool linear)
+        {
+            int blockBytes = (fmt == TextureFormat.DXT1 || fmt == TextureFormat.BC4) ? 8 : 16;
+            int mip0Size = ((w + 3) / 4) * ((h + 3) / 4) * blockBytes;
+
+            var tex = new Texture2D(w, h, fmt, false, linear)
+            {
+                name = name,
+                wrapMode = TextureWrapMode.Repeat,
+                filterMode = FilterMode.Bilinear,
+            };
+            int avail = data.Length - dataOffset;
+            if (avail < mip0Size)
+            {
+                UnityEngine.Object.DestroyImmediate(tex);
+                throw new Exception($"DDS {name}: truncated ({avail}/{mip0Size} bytes for {fmt})");
+            }
+            var mip0 = new byte[mip0Size];
+            Buffer.BlockCopy(data, dataOffset, mip0, 0, mip0Size);
+            tex.LoadRawTextureData(mip0);
+            tex.Apply(false, false);
+            return tex;
+        }
+
+        private static Texture2D BuildUncompressed32(
+            byte[] data, int dataOffset, int w, int h, Header header, string name, bool linear)
+        {
+            // Assume BGRA8 (most common for uncompressed WoT dds). Swap to RGBA.
+            int size = w * h * 4;
+            if (data.Length - dataOffset < size)
+                throw new Exception($"DDS {name}: truncated uncompressed data");
+            var px = new Color32[w * h];
+            bool bgr = header.PfBBitMask == 0xFF; // B in low byte => BGRA
+            for (int i = 0; i < w * h; i++)
+            {
+                int o = dataOffset + i * 4;
+                byte b0 = data[o], b1 = data[o + 1], b2 = data[o + 2], a = data[o + 3];
+                px[i] = bgr ? new Color32(b2, b1, b0, a) : new Color32(b0, b1, b2, a);
+            }
+            // DDS rows are top-to-bottom; Unity textures are bottom-to-top -> flip.
+            var flipped = new Color32[w * h];
+            for (int y = 0; y < h; y++)
+                Array.Copy(px, y * w, flipped, (h - 1 - y) * w, w);
+
+            var tex = new Texture2D(w, h, TextureFormat.RGBA32, false, linear)
+            {
+                name = name, wrapMode = TextureWrapMode.Repeat, filterMode = FilterMode.Bilinear,
+            };
+            tex.SetPixels32(flipped);
+            tex.Apply(false, false);
+            return tex;
+        }
+
+        private static TextureFormat DxgiToUnity(uint dxgi)
+        {
+            // Common DXGI_FORMAT values.
+            switch (dxgi)
+            {
+                case 71: case 72: return TextureFormat.DXT1;   // BC1_UNORM / _SRGB
+                case 74: case 75: return TextureFormat.DXT5;   // BC3_UNORM / _SRGB
+                case 80: return TextureFormat.BC4;             // BC4_UNORM
+                case 83: return TextureFormat.BC5;             // BC5_UNORM
+                case 98: case 99: return TextureFormat.BC7;    // BC7_UNORM / _SRGB
+                default: return (TextureFormat)0;
+            }
+        }
+
+        /// <summary>
+        /// Decodes a DXT1/DXT5 DDS to an uncompressed RGBA32 Texture2D that is
+        /// CPU-readable via GetPixels32(). Used for blend/normal maps where we
+        /// must read pixel weights on the CPU (compressed textures via
+        /// LoadRawTextureData are NOT readable).
+        /// </summary>
+        public static Texture2D ReadReadable(byte[] data, string name)
+        {
+            if (!TryReadHeader(data, out var header))
+                throw new Exception("Not a DDS file");
+
             int dataOffset = (int)header.Size + 4;
             if (dataOffset + 4 > data.Length) dataOffset = 128;
 
             int w = (int)header.Width, h = (int)header.Height;
             var pixels = new Color32[w * h];
-
-            // FourCC handling: 'DXT5', 'DXT1'
             string fourcc = FourCCToString(header.PfFourCC);
 
-            // Determine block size
             int blockSize = fourcc switch
             {
-                "DXT5" or "BC4" => 16,
-                "DXT1" or "BC1" => 8,
-                _ => throw new Exception($"Unsupported DDS FourCC: {fourcc}"),
+                "DXT5" => 16,
+                "DXT1" => 8,
+                _ => throw new Exception($"ReadReadable unsupported FourCC: {fourcc}"),
             };
 
             int blocksX = (w + 3) / 4;
             int blocksY = (h + 3) / 4;
-            int totalBlocks = blocksX * blocksY;
-
-            // For DXT5: each block = 16 bytes (8 bytes alpha + 8 bytes RGB)
-            // For DXT1: each block = 8 bytes (RGB, 1-bit alpha or none)
             using var ms = new MemoryStream(data, dataOffset, data.Length - dataOffset, false);
             using var br = new BinaryReader(ms);
-
             for (int by = 0; by < blocksY; by++)
-            {
                 for (int bx = 0; bx < blocksX; bx++)
                 {
-                    if (ms.Position + blockSize > ms.Length)
-                        break;
-
-                    if (fourcc == "DXT5")
-                        DecodeDXT5Block(br, bx, by, w, h, pixels);
-                    else
-                        DecodeDXT1Block(br, bx, by, w, h, pixels);
+                    if (ms.Position + blockSize > ms.Length) break;
+                    if (fourcc == "DXT5") DecodeDXT5Block(br, bx, by, w, h, pixels);
+                    else DecodeDXT1Block(br, bx, by, w, h, pixels);
                 }
-            }
 
             var tex = new Texture2D(w, h, TextureFormat.RGBA32, false, true)
             {
-                name = name,
-                wrapMode = TextureWrapMode.Repeat,
-                filterMode = FilterMode.Bilinear,
+                name = name, wrapMode = TextureWrapMode.Clamp, filterMode = FilterMode.Bilinear,
             };
             tex.SetPixels32(pixels);
             tex.Apply(false, false);
@@ -129,7 +243,18 @@ namespace WoTMapImporter.Editor.Image
         {
             byte a0 = br.ReadByte();
             byte a1 = br.ReadByte();
-            ulong alphaIdx = br.ReadUInt64();   // 16 3-bit indices, packed LSB first
+            // DXT5 alpha indices are 48 bits = 6 bytes (NOT 8). Reading a full
+            // UInt64 here consumed 2 extra bytes and desynced every subsequent
+            // block, producing constant/garbage weights -> one layer covering all.
+            byte ai0 = br.ReadByte(), ai1 = br.ReadByte(), ai2 = br.ReadByte();
+            byte ai3 = br.ReadByte(), ai4 = br.ReadByte(), ai5 = br.ReadByte();
+            ulong alphaIdx =
+                  (ulong)ai0
+                | ((ulong)ai1 << 8)
+                | ((ulong)ai2 << 16)
+                | ((ulong)ai3 << 24)
+                | ((ulong)ai4 << 32)
+                | ((ulong)ai5 << 40);   // 16 3-bit indices, packed LSB first
             ushort c0 = br.ReadUInt16();
             ushort c1 = br.ReadUInt16();
             uint colorIdx = br.ReadUInt32();    // 16 2-bit indices, packed LSB first

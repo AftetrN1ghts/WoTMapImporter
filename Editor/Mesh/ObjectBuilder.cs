@@ -85,16 +85,14 @@ namespace WoTMapImporter.Editor.Mesh
                     var tex = LoadTex(texData, texturePaths[0]);
                     if (tex != null)
                     {
-                        Shader sh = Shader.Find("Standard");
-                        mat = new Material(sh) { name = PathName(texturePaths[0]) + "_mat" };
-                        mat.mainTexture = tex;
+                        mat = CreatePipelineMaterial(PathName(texturePaths[0]) + "_mat");
+                        SetMaterialTexture(mat, tex);
                     }
                 }
             }
             if (mat == null)
             {
-                Shader sh = Shader.Find("Standard");
-                mat = new Material(sh) { name = "WoT_DefaultMat" };
+                mat = CreatePipelineMaterial("WoT_DefaultMat");
                 mat.color = Color.gray;
             }
 
@@ -153,6 +151,29 @@ namespace WoTMapImporter.Editor.Mesh
             AssetDatabase.CreateAsset(umesh, meshPath);
 
             return result;
+        }
+
+        /// <summary>
+        /// Creates a material using the shader appropriate for the active render
+        /// pipeline. On URP "Standard" doesn't exist -> magenta; we must use
+        /// "Universal Render Pipeline/Lit" (HDRP: "HDRP/Lit").
+        /// </summary>
+        private static Material CreatePipelineMaterial(string name)
+        {
+            Shader sh =
+                Shader.Find("Universal Render Pipeline/Lit") ??
+                Shader.Find("HDRP/Lit") ??
+                Shader.Find("Standard") ??
+                Shader.Find("Sprites/Default");
+            return new Material(sh) { name = name };
+        }
+
+        private static void SetMaterialTexture(Material mat, Texture2D tex)
+        {
+            // URP/Lit uses "_BaseMap", Built-in/Standard uses "_MainTex".
+            if (mat.HasProperty("_BaseMap")) mat.SetTexture("_BaseMap", tex);
+            if (mat.HasProperty("_MainTex")) mat.SetTexture("_MainTex", tex);
+            mat.mainTexture = tex;
         }
 
         private static Texture2D LoadTex(byte[] data, string name)

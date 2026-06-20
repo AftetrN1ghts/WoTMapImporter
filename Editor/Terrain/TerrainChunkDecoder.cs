@@ -211,7 +211,7 @@ namespace WoTMapImporter.Editor.Terrain
                 var full = new byte[dds.Length + expectedSize];
                 Buffer.BlockCopy(dds, 0, full, 0, dds.Length);
                 Buffer.BlockCopy(payload, 0, full, dds.Length, expectedSize);
-                var tex = DdsDecoder.Read(full, chunkName + "_normals");
+                var tex = DdsDecoder.ReadReadable(full, chunkName + "_normals");
                 tex.wrapMode = TextureWrapMode.Clamp;
                 tex.filterMode = FilterMode.Bilinear;
                 return tex;
@@ -302,7 +302,9 @@ namespace WoTMapImporter.Editor.Terrain
                     throw new Exception($"Blend texture short read: {blockData.Length}/{dataSize}");
                 Buffer.BlockCopy(blockData, 0, full, dds.Length, dataSize);
 
-                var tex = DdsDecoder.Read(full, $"{chunkName}_blend_{i}");
+                // Blend weights must be CPU-readable (we sample them on the CPU
+                // when building the splatmap), so use the RGBA32 decoder.
+                var tex = DdsDecoder.ReadReadable(full, $"{chunkName}_blend_{i}");
                 result.Add(tex);
             }
             return result;
